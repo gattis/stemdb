@@ -10,9 +10,6 @@ setup(
     ext_modules = [Extension(
         "stemdb",
         sources = ["stemdb.c"],
-        libraries = ["cmph"],
-        library_dirs = ["/hunch/appcore64/cmph/lib"],
-        include_dirs = ["/hunch/appcore64/cmph/include"],
         ) ],
     url = "http://code.google.com/p/stemdb/",
 )
