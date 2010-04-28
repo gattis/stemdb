@@ -11,7 +11,6 @@
 
 - stemdbtype.add_key(name,[col1,col2,...],nuniques=None)
     - further inserts update index (or fail if nvals > uniques and return indexes)
-- stemdbtype.get(key_name,[val1,val2,...]) => [row1,row2,...nuniques]
 - stemdbtype[x] = [val1,val2,...]
 - stemdb.open(filename)
 - stemdbtype.delete(key_name,[val1,val2,...]) 
@@ -114,68 +113,55 @@ static inline unsigned char isbitset(unsigned char field[], size_t idx)
 { return field[idx / 8] & (1u << (idx % 8)); }
 
 static inline unsigned char is_linked_list(void *node) {
-  //return ((unsigned char *)node)[0] & 32;
   return ((unsigned char *)node)[0] & 4;
 }
 
 static inline unsigned char left_is_leaf_node(void *node) {
-  //return ((unsigned char *)node)[0] & 128;
   return ((unsigned char *)node)[0] & 1;
 }
 
 static inline unsigned char right_is_leaf_node(void *node) {
-  //return ((unsigned char *)node)[0] & 64;
   return ((unsigned char *)node)[0] & 2;
 }
 
 static inline void set_linked_list(void *node) {
-  //((unsigned char *)node)[0] |= 32;
   ((unsigned char *)node)[0] |= 4;
 }
 
 static inline void left_set_leaf_node(void *node) {
-  //((unsigned char *)node)[0] |= 128;
   ((unsigned char *)node)[0] |= 1;
 }
 
 static inline void right_set_leaf_node(void *node) {
-  //((unsigned char *)node)[0] |= 64;
   ((unsigned char *)node)[0] |= 2;
 }
 
 static inline void unset_linked_list(void *node) {
-  //((unsigned char *)node)[0] &= ~32;
   ((unsigned char *)node)[0] &= ~4;
 }
 
 static inline void left_unset_leaf_node(void *node) {
-  //((unsigned char *)node)[0] &= ~128;
   ((unsigned char *)node)[0] &= ~1;
 }
 
 static inline void right_unset_leaf_node(void *node) {
-  //((unsigned char *)node)[0] &= ~64;
   ((unsigned char *)node)[0] &= ~2;
 }
 
 static inline uint64_t get_left_entry(void *node) {
-  //return (*((uint64_t *)node) & 0x0fffffffffffffff) >> 22;
   return (*((uint64_t *)node) &  0x3fffffffff0) >> 4;
 }
 
 static inline void set_left_entry(void *node, uint64_t val) {
-  //*((uint64_t *)node) &= 0xf0000000003fffff;
   *((uint64_t *)node) &= 0xfffffc000000000f;
   *((uint64_t *)node) ^= val << 4;
 }
 
 static inline uint64_t get_right_entry(void *node) {
-  //return *((uint64_t *)(node + 2)) & 0x3fffffffff;
   return (*((uint64_t *)(node + 2)) & 0xfffffffffc000000) >> 26;
 }
 
 static inline void set_right_entry(void *node, uint64_t val) {
-  //*((uint64_t *)(node + 2)) &= 0x03ffffff;
   *((uint64_t *)(node + 2)) &= 0x3ffffff;
   *((uint64_t *)(node + 2)) ^= (val << 26);
 }
@@ -204,7 +190,7 @@ static inline void * new_row(PyStemDBObject *stemdb) {
 
 }
 
-static inline void *new_node(stemdb_key *key) {
+static inline void *new_node(stemdb_key *key, void **cur_node) {
   uint64_t *num_free = key->meta + META_KEY_NUM_FREE_NODES_OFFSET;
   if (*num_free > 0) {
     (*num_free)--;
@@ -216,9 +202,11 @@ static inline void *new_node(stemdb_key *key) {
     key->data_size += ALLOCATION;
     if (ftruncate(key->data_fd, key->data_size) == -1)
       return PyErr_Format(PyExc_OSError,"ftruncate failed");
+    void *old_address = key->data;
     key->data = mremap(key->data, key->data_size - ALLOCATION, key->data_size, MREMAP_MAYMOVE);
     if (key->data == MAP_FAILED)
       return PyErr_Format(PyExc_OSError,"mremap failed: %d",errno);
+    *cur_node = key->data + (*cur_node - old_address);
   }
 
   (*num_nodes)++;
@@ -347,33 +335,31 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
 
 }
 
-static PyObject * stemdb_insert(PyStemDBObject *stemdb, PyObject *rows) {
-  PyObject *row_iter,*col_iter,**py_rows,**py_cols,*py_val;
-  Py_ssize_t ncols,nrows,r,c,bufsize,bufpos;
+static PyObject * stemdb_insert(PyStemDBObject *stemdb, PyObject *py_rows) {
+  PyObject *row_iter,*py_row,*py_val;
+  Py_ssize_t ncols,r,c,bufsize,bufpos;
   int64_t ival;
   uint64_t uval;
   uint32_t bit_pos;
   uint16_t num_bits,b;
   unsigned char *buffer;
 
-  if ((row_iter = PySequence_Fast(rows,"argument must be iterable")) == NULL) return NULL;
-  nrows = PySequence_Fast_GET_SIZE(row_iter);
-  py_rows = PySequence_Fast_ITEMS(row_iter);
-  for (r = 0; r < nrows; r++) {
-    if ((col_iter = PySequence_Fast(py_rows[r],"rows must be iterable")) == NULL) return NULL;   
-    ncols = PySequence_Fast_GET_SIZE(col_iter);
-    if (ncols != stemdb->num_cols)
-      return PyErr_Format(PyExc_TypeError,"row number %zd must contain %d elements",r,stemdb->num_cols);
-    py_cols = PySequence_Fast_ITEMS(col_iter);
+  row_iter = PyObject_GetIter(py_rows);
+  if (row_iter == NULL) return NULL;
+  r = 0;
+  while ((py_row = PyIter_Next(row_iter)) != NULL) {
+    
+    ncols = stemdb->num_cols;
 
     BITFIELD(stemdb->row_size,bf);
     bit_pos = 0;
 
     meta_col *db_col = stemdb->meta + META_HEADER_SIZE;
     for (c = 0; c < ncols; c++) {
-      py_val = py_cols[c];
+      py_val = PySequence_GetItem(py_row, c);
+      if (py_val == NULL) return NULL;
+      
       num_bits = db_col[c].num_bits;
-
       switch(db_col[c].type) {
       case 'i':
 
@@ -417,14 +403,22 @@ static PyObject * stemdb_insert(PyStemDBObject *stemdb, PyObject *rows) {
 	break;
 	
       }
+
+      Py_DECREF(py_val);
     }
+
     
     void *row = new_row(stemdb);
     if (row == NULL) return NULL;
     memcpy(row,bf,stemdb->row_bytes);
-    
 
+    r++;
+    //if (r % 1000000 == 0)
+    //  printf("%zd rows processed\n", r);
+    
+    Py_DECREF(py_row);
   }
+  Py_DECREF(row_iter);
 
   return Py_BuildValue("");
 }
@@ -699,7 +693,7 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	if (many > key->many && key->many != 0)
 	  return first_node;
 
-	next_node = new_node(key);
+	next_node = new_node(key,&cur_node);
 	set_linked_list(new_node);
 	set_left_entry(new_node,index);
 	set_right_entry(new_node,0);
@@ -714,7 +708,7 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	if (right_is_leaf_node(cur_node)) { // leaf node
 	  if ((b == (col->num_bits - 1)) && (i == (*num_key_cols - 1)) && (key->many == 1))
 	    return cur_node; // todo: return indication of which side is the dupe
-	  next_node = new_node(key);
+	  next_node = new_node(key,&cur_node);
 	  memset(next_node,0,NODE_SIZE);
 	  carry_entry = entry;
 	  right_unset_leaf_node(cur_node);
@@ -724,7 +718,7 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	  if (entry == 0) { // null pointer
 	    if ((!left_is_leaf_node(cur_node)) && (get_left_entry(cur_node) == 0) && (cur_node != key->data)) {
 	      if (isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) {
-		next_node = new_node(key);
+		next_node = new_node(key,&cur_node);
 		memset(next_node,0,NODE_SIZE);
 		right_unset_leaf_node(cur_node);
 		set_right_entry(cur_node,next_node - key->data);
@@ -752,7 +746,7 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	  if ((b == (col->num_bits - 1)) && (i == (*num_key_cols - 1)) && (key->many == 1))
 	    return cur_node; // todo: return indication of which side is the dupe
 
-	  next_node = new_node(key);
+	  next_node = new_node(key,&cur_node);
 	  memset(next_node,0,NODE_SIZE);
 
 	  carry_entry = entry;
@@ -764,7 +758,7 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	  if (entry == 0) { // null pointer
 	    if ((!right_is_leaf_node(cur_node)) && (get_right_entry(cur_node) == 0) && (cur_node != key->data)) {
 	      if (!isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) {
-		next_node = new_node(key);
+		next_node = new_node(key,&cur_node);
 		memset(next_node,0,NODE_SIZE);
 		left_unset_leaf_node(cur_node);
 		set_left_entry(cur_node,next_node - key->data);
@@ -892,8 +886,8 @@ static PyObject * stemdb_add_key(PyStemDBObject *stemdb, PyObject *args) {
   memcpy(key->meta + META_KEY_MANY_OFFSET, &(many_packed),8);
   memcpy(key->meta + META_KEY_COLS_OFFSET,col_indexes,sizeof(uint16_t)*num_key_cols);
 
- 
-  void *first_node = new_node(key);
+  void *cur_node = NULL;
+  void *first_node = new_node(key,&cur_node);
   memset(first_node,0,NODE_SIZE);
 
 
