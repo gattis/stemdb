@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 /* 
 
@@ -280,7 +281,7 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
     return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
  
   stemdb->num_cols = num_cols;
-  memcpy(stemdb->meta,&(stemdb->num_cols),META_NUM_COLS_OFFSET);
+  memcpy(stemdb->meta + META_NUM_COLS_OFFSET,&(stemdb->num_cols),2);
  
   stemdb->row_size = 0;
 
@@ -330,6 +331,126 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
   uint64_t num_rows = 0,num_free_rows = 0;
   memcpy(stemdb->meta + META_NUM_ROWS_OFFSET,&(num_rows),8);
   memcpy(stemdb->meta + META_NUM_FREE_ROWS_OFFSET,&(num_free_rows),8); 
+
+  return (PyObject *)stemdb;
+
+}
+
+stemdb_key* open_key(PyStemDBObject *stemdb, char *file_name) {
+  
+  uint16_t i;
+  stemdb_key *key;
+  char key_name[32] = "";
+  strncat(key_name,file_name,strrchr(file_name,'.') - file_name);
+  
+  for (i = 0; i < stemdb->num_keys; i++) {
+    key = stemdb->keys[i];
+    if (strcmp(key->name,key_name) == 0)
+      return key;
+  }
+
+  key = malloc(sizeof(stemdb_key));
+  strcpy(key->name,key_name);
+
+  stemdb->num_keys++;
+  if (stemdb->keys == NULL)
+    stemdb->keys = malloc(sizeof(stemdb_key *) * stemdb->num_keys);
+  else
+    stemdb->keys = realloc(stemdb->keys, sizeof(stemdb_key *) * stemdb->num_keys);
+  stemdb->keys[stemdb->num_keys - 1] = key;
+
+  return key;
+
+}
+
+static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
+
+  char *dir_name = PyString_AsString(py_dir_name);
+  if (dir_name == NULL) return NULL;
+  
+  DIR *dp = opendir(dir_name);
+  if (dp == NULL) PyErr_Format(PyExc_OSError,"could not open directory '%s'", dir_name);
+  char * file_name = malloc(strlen(dir_name) + 50);
+  char * fname_offset = file_name + strlen(dir_name) + 1;
+  strcpy(file_name,dir_name);
+  strcpy(fname_offset - 1,"/");
+ 
+
+  PyStemDBObject *stemdb;
+  stemdb_key *key;
+  if ((stemdb = PyObject_New(PyStemDBObject,&PyStemDBType)) == NULL) return NULL;
+  stemdb->keys = NULL;
+  stemdb->num_keys = 0;
+
+  struct dirent *ep;
+  struct stat st;
+  int fd;
+  while ((ep = readdir(dp)) != NULL) {
+    stat(ep->d_name,&st);
+    strcpy(fname_offset, ep->d_name);
+    fd = open(file_name, O_RDWR);
+    if (strcmp(ep->d_name,"data") == 0) {
+      stemdb->data_size = st.st_size;
+      stemdb->data_fd = fd;
+    } else if (strcmp(ep->d_name,"free") == 0) {
+      stemdb->free_size = st.st_size;
+      stemdb->free_fd = fd;
+    } else if (strcmp(ep->d_name,"meta") == 0) {
+      stemdb->meta_size = st.st_size;
+      stemdb->meta_fd = fd;
+    } else if (strstr(ep->d_name,".keyd")) {
+      key = open_key(stemdb, ep->d_name);
+      key->data_size = st.st_size;
+      key->data_fd = fd;
+    } else if (strstr(ep->d_name,".keyf")) {
+      key = open_key(stemdb, ep->d_name);
+      key->free_size = st.st_size;
+      key->free_fd = fd;
+    } else if (strstr(ep->d_name,".keym")) {
+      key = open_key(stemdb, ep->d_name);
+      key->meta_size = st.st_size;
+      key->meta_fd = fd;
+    }
+    
+    if (stemdb->data_fd == -1 || stemdb->free_fd == -1 || stemdb->meta_fd == -1)
+      return PyErr_Format(PyExc_OSError,"failed to open files from disk");
+
+  }
+  closedir(dp);
+
+  stemdb->dir_name = malloc(strlen(dir_name) + 1);
+  strcpy(stemdb->dir_name,dir_name);
+
+  if ((stemdb->data = mmap(NULL,stemdb->data_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->data_fd,0)) == MAP_FAILED)
+    return PyErr_Format(PyExc_OSError,"failed to mmap data segment");
+
+  if ((stemdb->free = mmap(NULL,stemdb->free_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->free_fd,0)) == MAP_FAILED)
+    return PyErr_Format(PyExc_OSError,"failed to mmap free segment");
+
+  if ((stemdb->meta = mmap(NULL,stemdb->meta_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->meta_fd,0)) == MAP_FAILED)
+    return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
+ 
+  stemdb->num_cols = *(uint16_t*)(stemdb->meta + META_NUM_COLS_OFFSET);
+  stemdb->row_size = *(uint32_t*)(stemdb->meta + META_ROW_SIZE_OFFSET);
+  stemdb->row_bytes = stemdb->row_size / 8;
+  if (stemdb->row_bytes * 8 < stemdb->row_size)
+    stemdb->row_bytes++;
+
+  uint16_t i;
+  for (i = 0; i < stemdb->num_keys; i++) {
+    key = stemdb->keys[i];
+
+    if (key->data_fd == -1 || key->free_fd == -1 || key->meta_fd == -1) 
+      return PyErr_Format(PyExc_OSError,"failed to open index file: %s", key->name);
+    if ((key->data = mmap(NULL,key->data_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->data_fd,0)) == MAP_FAILED)
+      return PyErr_Format(PyExc_OSError,"failed to mmap data segment");
+    if ((key->free = mmap(NULL,key->free_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->free_fd,0)) == MAP_FAILED)
+      return PyErr_Format(PyExc_OSError,"failed to mmap free segment");
+    if ((key->meta = mmap(NULL,key->meta_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->meta_fd,0)) == MAP_FAILED)
+      return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
+
+    key->many = *(uint64_t*)(key->meta + META_KEY_MANY_OFFSET);
+  }
 
   return (PyObject *)stemdb;
 
@@ -931,12 +1052,10 @@ static PyObject * stemdb_item(PyStemDBObject *stemdb, Py_ssize_t index) {
 
   ncols = stemdb->num_cols;
   py_row = PyTuple_New(ncols);
-
   for (c = 0; c < ncols; c++) {
 
     meta_col *db_col = stemdb->meta + META_HEADER_SIZE;
     num_bits = db_col[c].num_bits;
-    
     switch(db_col[c].type) {
     case 'i':
 
@@ -1098,6 +1217,7 @@ static PyTypeObject PyStemDBType = {
 
 static PyMethodDef stemdb_module_methods[] = {
   {"new", stemdb_new, METH_VARARGS, "Create a new stemdb"},
+  {"open", stemdb_open, METH_O, "Open a stemdb"},
   {"test", (PyCFunction) stemdb_test, METH_NOARGS},
   {NULL, NULL, 0, NULL}
 };
