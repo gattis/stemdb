@@ -11,8 +11,6 @@
 
 === TODO ===
 
-- stemdbtype.add_key(name,[col1,col2,...],nuniques=None)
-    - further inserts update index (or fail if nvals > uniques and return indexes)
 - stemdbtype[x] = [val1,val2,...]
 - stemdbtype.delete(key_name,[val1,val2,...]) 
     - deletes from data and key index
@@ -466,13 +464,140 @@ static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
 
 }
 
+
+void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
+
+  uint16_t i,b, *num_key_cols = key->meta + META_KEY_NUM_COLS_OFFSET;
+  uint32_t bit_pos = 0;
+  uint16_t *col_indexes = key->meta + META_KEY_COLS_OFFSET;
+  void *cur_node = key->data, *next_node, *first_node;
+  meta_col *col;
+  uint64_t entry,carry_entry = 0, many;
+  unsigned char bit, *row = stemdb->data + stemdb->row_bytes * index;
+
+  for (i = 0; i < *num_key_cols; i++) {
+    col = stemdb->meta + META_HEADER_SIZE + col_indexes[i] * sizeof(meta_col);
+    for (b = 0; b < col->num_bits; b++, bit_pos++) {
+
+      if (is_linked_list(cur_node)) {
+	first_node = cur_node;
+	many = 1;
+	entry = get_right_entry(cur_node);
+	while (entry != 0) { 
+	  many += 1;
+	  cur_node = key->data + entry;
+	  entry = get_right_entry(cur_node);
+	}
+
+	if (many > key->many && key->many != 0)
+	  return first_node;
+
+	next_node = new_node(key);
+	set_linked_list(new_node);
+	set_left_entry(new_node,index);
+	set_right_entry(new_node,0);
+	set_right_entry(cur_node,next_node - key->data);
+	return NULL;
+      }
+
+
+      bit = isbitset(row,col->bit_offset+b);
+      if (bit) { // right
+	entry = get_right_entry(cur_node);
+	if (right_is_leaf_node(cur_node)) { // leaf node
+	  if ((b == (col->num_bits - 1)) && (i == (*num_key_cols - 1)) && (key->many == 1))
+	    return cur_node; // todo: return indication of which side is the dupe
+	  next_node = new_node(key);
+	  memset(next_node,0,NODE_SIZE);
+	  carry_entry = entry;
+	  right_unset_leaf_node(cur_node);
+	  set_right_entry(cur_node,next_node - key->data);
+	  cur_node = next_node;
+	} else { // pointer node
+	  if (entry == 0) { // null pointer
+	    if ((!left_is_leaf_node(cur_node)) && (get_left_entry(cur_node) == 0) && (cur_node != key->data)) {
+	      if (isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) {
+		next_node = new_node(key);
+		memset(next_node,0,NODE_SIZE);
+		right_unset_leaf_node(cur_node);
+		set_right_entry(cur_node,next_node - key->data);
+		cur_node = next_node;
+	      } else { 
+		set_left_entry(cur_node,carry_entry);
+		left_set_leaf_node(cur_node);
+		set_right_entry(cur_node, index);
+		right_set_leaf_node(cur_node);
+
+		return NULL;
+	      }
+	    } else {
+	      set_right_entry(cur_node, index);
+	      right_set_leaf_node(cur_node);
+	      return NULL;
+	    }
+	  } else { // valid pointer
+	    cur_node = key->data + entry;
+	  }
+	}
+      } else { // left
+	entry = get_left_entry(cur_node);
+	if (left_is_leaf_node(cur_node)) { // leaf node
+	  if ((b == (col->num_bits - 1)) && (i == (*num_key_cols - 1)) && (key->many == 1))
+	    return cur_node; // todo: return indication of which side is the dupe
+
+	  next_node = new_node(key);
+	  memset(next_node,0,NODE_SIZE);
+
+	  carry_entry = entry;
+	  left_unset_leaf_node(cur_node);
+	  set_left_entry(cur_node,next_node - key->data);
+	  cur_node = next_node;
+	  
+	} else { // pointer node
+	  if (entry == 0) { // null pointer
+	    if ((!right_is_leaf_node(cur_node)) && (get_right_entry(cur_node) == 0) && (cur_node != key->data)) {
+	      if (!isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) {
+		next_node = new_node(key);
+		memset(next_node,0,NODE_SIZE);
+		left_unset_leaf_node(cur_node);
+		set_left_entry(cur_node,next_node - key->data);
+		cur_node = next_node;
+	      } else {
+		set_right_entry(cur_node,carry_entry);
+		right_set_leaf_node(cur_node);
+		set_left_entry(cur_node, index);
+		left_set_leaf_node(cur_node);
+		return NULL;
+	      }
+	    } else {
+	      set_left_entry(cur_node, index);
+	      left_set_leaf_node(cur_node);
+	      return NULL;
+	    }
+	  } else { // valid pointer
+	    cur_node = key->data + entry;
+	  }
+	}
+      }
+    } 
+  }
+
+
+  set_left_entry(cur_node,carry_entry);
+  set_linked_list(cur_node);
+
+  return NULL;
+
+}
+
+
 static PyObject * stemdb_insert(PyStemDBObject *stemdb, PyObject *py_rows) {
   PyObject *row_iter,*py_row,*py_val;
   Py_ssize_t ncols,r,c,bufsize,bufpos;
   int64_t ival;
-  uint64_t uval;
+  uint64_t uval,inserted_row;
   uint32_t bit_pos;
-  uint16_t num_bits,b;
+  uint16_t num_bits,b,k;
   unsigned char *buffer;
 
   row_iter = PyObject_GetIter(py_rows);
@@ -542,6 +667,11 @@ static PyObject * stemdb_insert(PyStemDBObject *stemdb, PyObject *py_rows) {
     void *row = new_row(stemdb);
     if (row == NULL) return NULL;
     memcpy(row,bf,stemdb->row_bytes);
+
+    inserted_row = (row - stemdb->data) / stemdb->row_bytes;
+    for (k = 0; k < stemdb->num_keys; k++)
+      if (index_row(stemdb, inserted_row, stemdb->keys[k]) != NULL)
+	return PyErr_Format(PyExc_ValueError,"too many identical values found");
 
     r++;
     //if (r % 1000000 == 0)
@@ -797,130 +927,6 @@ static PyObject * stemdb_get(PyStemDBObject *stemdb, PyObject *args) {
   return py_indexes;
 }
 
-void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
-
-  uint16_t i,b, *num_key_cols = key->meta + META_KEY_NUM_COLS_OFFSET;
-  uint32_t bit_pos = 0;
-  uint16_t *col_indexes = key->meta + META_KEY_COLS_OFFSET;
-  void *cur_node = key->data, *next_node, *first_node;
-  meta_col *col;
-  uint64_t entry,carry_entry = 0, many;
-  unsigned char bit, *row = stemdb->data + stemdb->row_bytes * index;
-
-  for (i = 0; i < *num_key_cols; i++) {
-    col = stemdb->meta + META_HEADER_SIZE + col_indexes[i] * sizeof(meta_col);
-    for (b = 0; b < col->num_bits; b++, bit_pos++) {
-
-      if (is_linked_list(cur_node)) {
-	first_node = cur_node;
-	many = 1;
-	entry = get_right_entry(cur_node);
-	while (entry != 0) { 
-	  many += 1;
-	  cur_node = key->data + entry;
-	  entry = get_right_entry(cur_node);
-	}
-
-	if (many > key->many && key->many != 0)
-	  return first_node;
-
-	next_node = new_node(key);
-	set_linked_list(new_node);
-	set_left_entry(new_node,index);
-	set_right_entry(new_node,0);
-	set_right_entry(cur_node,next_node - key->data);
-	return NULL;
-      }
-
-
-      bit = isbitset(row,col->bit_offset+b);
-      if (bit) { // right
-	entry = get_right_entry(cur_node);
-	if (right_is_leaf_node(cur_node)) { // leaf node
-	  if ((b == (col->num_bits - 1)) && (i == (*num_key_cols - 1)) && (key->many == 1))
-	    return cur_node; // todo: return indication of which side is the dupe
-	  next_node = new_node(key);
-	  memset(next_node,0,NODE_SIZE);
-	  carry_entry = entry;
-	  right_unset_leaf_node(cur_node);
-	  set_right_entry(cur_node,next_node - key->data);
-	  cur_node = next_node;
-	} else { // pointer node
-	  if (entry == 0) { // null pointer
-	    if ((!left_is_leaf_node(cur_node)) && (get_left_entry(cur_node) == 0) && (cur_node != key->data)) {
-	      if (isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) {
-		next_node = new_node(key);
-		memset(next_node,0,NODE_SIZE);
-		right_unset_leaf_node(cur_node);
-		set_right_entry(cur_node,next_node - key->data);
-		cur_node = next_node;
-	      } else { 
-		set_left_entry(cur_node,carry_entry);
-		left_set_leaf_node(cur_node);
-		set_right_entry(cur_node, index);
-		right_set_leaf_node(cur_node);
-
-		return NULL;
-	      }
-	    } else {
-	      set_right_entry(cur_node, index);
-	      right_set_leaf_node(cur_node);
-	      return NULL;
-	    }
-	  } else { // valid pointer
-	    cur_node = key->data + entry;
-	  }
-	}
-      } else { // left
-	entry = get_left_entry(cur_node);
-	if (left_is_leaf_node(cur_node)) { // leaf node
-	  if ((b == (col->num_bits - 1)) && (i == (*num_key_cols - 1)) && (key->many == 1))
-	    return cur_node; // todo: return indication of which side is the dupe
-
-	  next_node = new_node(key);
-	  memset(next_node,0,NODE_SIZE);
-
-	  carry_entry = entry;
-	  left_unset_leaf_node(cur_node);
-	  set_left_entry(cur_node,next_node - key->data);
-	  cur_node = next_node;
-	  
-	} else { // pointer node
-	  if (entry == 0) { // null pointer
-	    if ((!right_is_leaf_node(cur_node)) && (get_right_entry(cur_node) == 0) && (cur_node != key->data)) {
-	      if (!isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) {
-		next_node = new_node(key);
-		memset(next_node,0,NODE_SIZE);
-		left_unset_leaf_node(cur_node);
-		set_left_entry(cur_node,next_node - key->data);
-		cur_node = next_node;
-	      } else {
-		set_right_entry(cur_node,carry_entry);
-		right_set_leaf_node(cur_node);
-		set_left_entry(cur_node, index);
-		left_set_leaf_node(cur_node);
-		return NULL;
-	      }
-	    } else {
-	      set_left_entry(cur_node, index);
-	      left_set_leaf_node(cur_node);
-	      return NULL;
-	    }
-	  } else { // valid pointer
-	    cur_node = key->data + entry;
-	  }
-	}
-      }
-    } 
-  }
-
-
-  set_left_entry(cur_node,carry_entry);
-  set_linked_list(cur_node);
-
-  return NULL;
-
-}
 
 // stemdbtype.add_key(name,[col1,col2,...],nuniques=None)
 static PyObject * stemdb_add_key(PyStemDBObject *stemdb, PyObject *args) {
