@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 
+
 /* 
 
 === TODO ===
@@ -84,6 +85,10 @@ typedef struct meta_col {
   uint32_t bit_offset;
 } __attribute__((packed)) meta_col;
 
+#ifndef O_NOATIME
+#define O_NOATIME 0
+#endif
+
 
 #define META_NUM_COLS_OFFSET 0
 #define META_ROW_SIZE_OFFSET 2
@@ -99,7 +104,8 @@ typedef struct meta_col {
 
 
 #define NODE_SIZE 10
-#define ALLOCATION 4096
+#define ALLOCATION 4096 // file size increment
+#define RESERVE 0x100000000000L // max data file size
 
 #define BITFIELD(SIZE, NAME) unsigned char NAME[(SIZE) / 8 + ((SIZE) % 8 != 0)]
 
@@ -181,10 +187,7 @@ static inline void * new_row(PyStemDBObject *stemdb) {
     stemdb->data_size += ALLOCATION;
     if (ftruncate(stemdb->data_fd, stemdb->data_size) == -1)
       return PyErr_Format(PyExc_OSError,"ftruncate failed");
-    stemdb->data = mremap(stemdb->data, stemdb->data_size - ALLOCATION, stemdb->data_size, MREMAP_MAYMOVE);
     madvise(stemdb->data + stemdb->data_size - ALLOCATION, ALLOCATION, MADV_SEQUENTIAL);
-    if (stemdb->data == MAP_FAILED)
-      return PyErr_Format(PyExc_OSError,"mremap failed: %d",errno);
   }
 
   (*num_rows)++;
@@ -192,7 +195,7 @@ static inline void * new_row(PyStemDBObject *stemdb) {
 
 }
 
-static inline void *new_node(stemdb_key *key, void **cur_node) {
+static inline void *new_node(stemdb_key *key) {
   uint64_t *num_free = key->meta + META_KEY_NUM_FREE_NODES_OFFSET;
   if (*num_free > 0) {
     (*num_free)--;
@@ -205,12 +208,7 @@ static inline void *new_node(stemdb_key *key, void **cur_node) {
     key->data_size += ALLOCATION;
     if (ftruncate(key->data_fd, key->data_size) == -1)
       return PyErr_Format(PyExc_OSError,"ftruncate failed");
-    void *old_address = key->data;
-    key->data = mremap(key->data, key->data_size - ALLOCATION, key->data_size, MREMAP_MAYMOVE);
-    if (key->data == MAP_FAILED)
-      return PyErr_Format(PyExc_OSError,"mremap failed: %d",errno);
     madvise(key->data + key->data_size - ALLOCATION, ALLOCATION, MADV_SEQUENTIAL);
-    *cur_node = key->data + (*cur_node - old_address);
   }
 
   (*num_nodes)++;
@@ -251,13 +249,13 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
     strcpy(file_name,dir_name);
 
     strcpy(file_name+dir_name_len,"/data");
-    stemdb->data_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC);
+    stemdb->data_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC | O_NOATIME, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 
     strcpy(file_name+dir_name_len,"/free");
-    stemdb->free_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC);
+    stemdb->free_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC | O_NOATIME, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 
     strcpy(file_name+dir_name_len,"/meta");
-    stemdb->meta_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC);
+    stemdb->meta_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC | O_NOATIME, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 
     if (stemdb->data_fd == -1 || stemdb->free_fd == -1 || stemdb->meta_fd == -1 || 
 	ftruncate(stemdb->data_fd, stemdb->data_size) == -1 ||
@@ -274,16 +272,16 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
 
 
 
-  if ((stemdb->data = mmap(NULL,stemdb->data_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->data_fd,0)) == MAP_FAILED)
-    return PyErr_Format(PyExc_OSError,"failed to mmap data segment");
+  if ((stemdb->data = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->data_fd,0)) == MAP_FAILED)
+    return PyErr_Format(PyExc_OSError,"failed to mmap data segment: %d", errno);
   madvise(stemdb->data, stemdb->data_size, MADV_SEQUENTIAL);
 
-  if ((stemdb->free = mmap(NULL,stemdb->free_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->free_fd,0)) == MAP_FAILED)
-    return PyErr_Format(PyExc_OSError,"failed to mmap free segment");
+  if ((stemdb->free = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->free_fd,0)) == MAP_FAILED)
+    return PyErr_Format(PyExc_OSError,"failed to mmap free segment: %d", errno);
   madvise(stemdb->free, stemdb->free_size, MADV_SEQUENTIAL);
 
-  if ((stemdb->meta = mmap(NULL,stemdb->meta_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->meta_fd,0)) == MAP_FAILED)
-    return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
+  if ((stemdb->meta = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->meta_fd,0)) == MAP_FAILED)
+    return PyErr_Format(PyExc_OSError,"failed to mmap meta segment: %d", errno);
   madvise(stemdb->meta, stemdb->meta_size, MADV_SEQUENTIAL);
  
   stemdb->num_cols = num_cols;
@@ -394,7 +392,7 @@ static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
   while ((ep = readdir(dp)) != NULL) {
     stat(ep->d_name,&st);
     strcpy(fname_offset, ep->d_name);
-    fd = open(file_name, O_RDWR);
+    fd = open(file_name, O_RDWR | O_NOATIME);
     if (strcmp(ep->d_name,"data") == 0) {
       stemdb->data_size = st.st_size;
       stemdb->data_fd = fd;
@@ -419,7 +417,7 @@ static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
     }
     
     if (stemdb->data_fd == -1 || stemdb->free_fd == -1 || stemdb->meta_fd == -1)
-      return PyErr_Format(PyExc_OSError,"failed to open files from disk");
+      return PyErr_Format(PyExc_OSError,"failed to open files from disk: %s", file_name);
 
   }
   closedir(dp);
@@ -427,15 +425,15 @@ static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
   stemdb->dir_name = malloc(strlen(dir_name) + 1);
   strcpy(stemdb->dir_name,dir_name);
 
-  if ((stemdb->data = mmap(NULL,stemdb->data_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->data_fd,0)) == MAP_FAILED)
+  if ((stemdb->data = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->data_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap data segment");
   madvise(stemdb->data, stemdb->data_size, MADV_RANDOM);
 
-  if ((stemdb->free = mmap(NULL,stemdb->free_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->free_fd,0)) == MAP_FAILED)
+  if ((stemdb->free = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->free_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap free segment");
   madvise(stemdb->free, stemdb->free_size, MADV_RANDOM);
 
-  if ((stemdb->meta = mmap(NULL,stemdb->meta_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->meta_fd,0)) == MAP_FAILED)
+  if ((stemdb->meta = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->meta_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
   madvise(stemdb->meta, stemdb->meta_size, MADV_RANDOM);
  
@@ -451,13 +449,13 @@ static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
 
     if (key->data_fd == -1 || key->free_fd == -1 || key->meta_fd == -1) 
       return PyErr_Format(PyExc_OSError,"failed to open index file: %s", key->name);
-    if ((key->data = mmap(NULL,key->data_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->data_fd,0)) == MAP_FAILED)
+    if ((key->data = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,key->data_fd,0)) == MAP_FAILED)
       return PyErr_Format(PyExc_OSError,"failed to mmap data segment");
     madvise(key->data, key->data_size, MADV_RANDOM);
-    if ((key->free = mmap(NULL,key->free_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->free_fd,0)) == MAP_FAILED)
+    if ((key->free = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,key->free_fd,0)) == MAP_FAILED)
       return PyErr_Format(PyExc_OSError,"failed to mmap free segment");
     madvise(key->free, key->free_size, MADV_RANDOM);
-    if ((key->meta = mmap(NULL,key->meta_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->meta_fd,0)) == MAP_FAILED)
+    if ((key->meta = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,key->meta_fd,0)) == MAP_FAILED)
       return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
     madvise(key->meta, key->meta_size, MADV_RANDOM);
 
@@ -826,7 +824,7 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	if (many > key->many && key->many != 0)
 	  return first_node;
 
-	next_node = new_node(key,&cur_node);
+	next_node = new_node(key);
 	set_linked_list(new_node);
 	set_left_entry(new_node,index);
 	set_right_entry(new_node,0);
@@ -841,7 +839,7 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	if (right_is_leaf_node(cur_node)) { // leaf node
 	  if ((b == (col->num_bits - 1)) && (i == (*num_key_cols - 1)) && (key->many == 1))
 	    return cur_node; // todo: return indication of which side is the dupe
-	  next_node = new_node(key,&cur_node);
+	  next_node = new_node(key);
 	  memset(next_node,0,NODE_SIZE);
 	  carry_entry = entry;
 	  right_unset_leaf_node(cur_node);
@@ -851,7 +849,7 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	  if (entry == 0) { // null pointer
 	    if ((!left_is_leaf_node(cur_node)) && (get_left_entry(cur_node) == 0) && (cur_node != key->data)) {
 	      if (isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) {
-		next_node = new_node(key,&cur_node);
+		next_node = new_node(key);
 		memset(next_node,0,NODE_SIZE);
 		right_unset_leaf_node(cur_node);
 		set_right_entry(cur_node,next_node - key->data);
@@ -879,7 +877,7 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	  if ((b == (col->num_bits - 1)) && (i == (*num_key_cols - 1)) && (key->many == 1))
 	    return cur_node; // todo: return indication of which side is the dupe
 
-	  next_node = new_node(key,&cur_node);
+	  next_node = new_node(key);
 	  memset(next_node,0,NODE_SIZE);
 
 	  carry_entry = entry;
@@ -891,7 +889,7 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	  if (entry == 0) { // null pointer
 	    if ((!right_is_leaf_node(cur_node)) && (get_right_entry(cur_node) == 0) && (cur_node != key->data)) {
 	      if (!isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) {
-		next_node = new_node(key,&cur_node);
+		next_node = new_node(key);
 		memset(next_node,0,NODE_SIZE);
 		left_unset_leaf_node(cur_node);
 		set_left_entry(cur_node,next_node - key->data);
@@ -984,13 +982,13 @@ static PyObject * stemdb_add_key(PyStemDBObject *stemdb, PyObject *args) {
     strcpy(file_name+dir_name_len + 1,key_name);
     
     strcpy(file_name+dir_name_len+1+key_name_len,".keyd");
-    key->data_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC);
+    key->data_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC | O_NOATIME, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 
     strcpy(file_name+dir_name_len+1+key_name_len,".keym");
-    key->meta_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC);
+    key->meta_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC | O_NOATIME, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 
     strcpy(file_name+dir_name_len+1+key_name_len,".keyf");
-    key->free_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC);
+    key->free_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC | O_NOATIME, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 
     if (key->data_fd == -1 || key->free_fd == -1 || key->meta_fd == -1 || 
 	ftruncate(key->data_fd, key->data_size) == -1 ||
@@ -1002,15 +1000,15 @@ static PyObject * stemdb_add_key(PyStemDBObject *stemdb, PyObject *args) {
     return PyErr_Format(PyExc_OSError,"In-memory indexing not implemented yet");
   }
 
-  if ((key->data = mmap(NULL,key->data_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->data_fd,0)) == MAP_FAILED)
+  if ((key->data = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,key->data_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap data segment");
   madvise(key->data, key->data_size, MADV_SEQUENTIAL);
 
-  if ((key->free = mmap(NULL,key->free_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->free_fd,0)) == MAP_FAILED)
+  if ((key->free = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,key->free_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap free segment");
   madvise(key->free, key->free_size, MADV_SEQUENTIAL);
 
-  if ((key->meta = mmap(NULL,key->meta_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->meta_fd,0)) == MAP_FAILED)
+  if ((key->meta = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,key->meta_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
   madvise(key->meta, key->meta_size, MADV_SEQUENTIAL);
 
@@ -1021,8 +1019,7 @@ static PyObject * stemdb_add_key(PyStemDBObject *stemdb, PyObject *args) {
   memcpy(key->meta + META_KEY_MANY_OFFSET, &(many_packed),8);
   memcpy(key->meta + META_KEY_COLS_OFFSET,col_indexes,sizeof(uint16_t)*num_key_cols);
 
-  void *cur_node = NULL;
-  void *first_node = new_node(key,&cur_node);
+  void *first_node = new_node(key);
   memset(first_node,0,NODE_SIZE);
 
 
@@ -1060,7 +1057,7 @@ static PyObject * stemdb_item(PyStemDBObject *stemdb, Py_ssize_t index) {
 
   uint64_t *num_rows = stemdb->meta + META_NUM_ROWS_OFFSET;
   if (index >= *num_rows)
-    return PyErr_Format(PyExc_TypeError,"index too large, db only has %ld rows",*num_rows);
+    return PyErr_Format(PyExc_TypeError,"index too large, db only has %llu rows",*num_rows);
   unsigned char *bf = stemdb->data + stemdb->row_bytes * index;
   bit_pos = 0;
 
@@ -1160,35 +1157,35 @@ static void stemdb_dealloc(PyStemDBObject *stemdb) {
 static PyObject * stemdb_test(PyObject *self, PyObject *nothing) {
   void *node = malloc(10);
   memset(node,0,10);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
   set_right_entry(node, 20);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
   set_left_entry(node, 20);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
   set_linked_list(node);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
   left_set_leaf_node(node);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
   right_set_leaf_node(node);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
   unset_linked_list(node);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
   left_unset_leaf_node(node);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
   right_unset_leaf_node(node);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
   set_right_entry(node,66763);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));
   set_left_entry(node,66763);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));  
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));  
   set_left_entry(node, 274877906943);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));  
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));  
   set_right_entry(node, 274877906943);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));  
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));  
   right_set_leaf_node(node);
   left_set_leaf_node(node);  
   set_linked_list(node);
-  printf("left: %ld, right: %ld, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));  
+  printf("left: %llu, right: %llu, left leaf: %d, right leaf: %d, linked list: %d\n",get_left_entry(node),get_right_entry(node),left_is_leaf_node(node),right_is_leaf_node(node),is_linked_list(node));  
 
   unsigned char *ch = node;
   long i;
