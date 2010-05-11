@@ -13,7 +13,6 @@
 - stemdbtype.add_key(name,[col1,col2,...],nuniques=None)
     - further inserts update index (or fail if nvals > uniques and return indexes)
 - stemdbtype[x] = [val1,val2,...]
-- stemdb.open(filename)
 - stemdbtype.delete(key_name,[val1,val2,...]) 
     - deletes from data and key index
 - stemdb.delete_key
@@ -178,10 +177,12 @@ static inline void * new_row(PyStemDBObject *stemdb) {
   uint64_t *num_rows = stemdb->meta + META_NUM_ROWS_OFFSET;
 
   if (((*num_rows + 1) * stemdb->row_bytes) > stemdb->data_size) {
+    madvise(stemdb->data + stemdb->data_size - ALLOCATION, ALLOCATION, MADV_RANDOM);
     stemdb->data_size += ALLOCATION;
     if (ftruncate(stemdb->data_fd, stemdb->data_size) == -1)
       return PyErr_Format(PyExc_OSError,"ftruncate failed");
     stemdb->data = mremap(stemdb->data, stemdb->data_size - ALLOCATION, stemdb->data_size, MREMAP_MAYMOVE);
+    madvise(stemdb->data + stemdb->data_size - ALLOCATION, ALLOCATION, MADV_SEQUENTIAL);
     if (stemdb->data == MAP_FAILED)
       return PyErr_Format(PyExc_OSError,"mremap failed: %d",errno);
   }
@@ -200,6 +201,7 @@ static inline void *new_node(stemdb_key *key, void **cur_node) {
 
   uint64_t *num_nodes = key->meta + META_KEY_NUM_NODES_OFFSET;
   if (((*num_nodes + 1) * NODE_SIZE) > key->data_size) {
+    madvise(key->data + key->data_size - ALLOCATION, ALLOCATION, MADV_RANDOM);
     key->data_size += ALLOCATION;
     if (ftruncate(key->data_fd, key->data_size) == -1)
       return PyErr_Format(PyExc_OSError,"ftruncate failed");
@@ -207,6 +209,7 @@ static inline void *new_node(stemdb_key *key, void **cur_node) {
     key->data = mremap(key->data, key->data_size - ALLOCATION, key->data_size, MREMAP_MAYMOVE);
     if (key->data == MAP_FAILED)
       return PyErr_Format(PyExc_OSError,"mremap failed: %d",errno);
+    madvise(key->data + key->data_size - ALLOCATION, ALLOCATION, MADV_SEQUENTIAL);
     *cur_node = key->data + (*cur_node - old_address);
   }
 
@@ -273,12 +276,15 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
 
   if ((stemdb->data = mmap(NULL,stemdb->data_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->data_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap data segment");
+  madvise(stemdb->data, stemdb->data_size, MADV_SEQUENTIAL);
 
   if ((stemdb->free = mmap(NULL,stemdb->free_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->free_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap free segment");
+  madvise(stemdb->free, stemdb->free_size, MADV_SEQUENTIAL);
 
   if ((stemdb->meta = mmap(NULL,stemdb->meta_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->meta_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
+  madvise(stemdb->meta, stemdb->meta_size, MADV_SEQUENTIAL);
  
   stemdb->num_cols = num_cols;
   memcpy(stemdb->meta + META_NUM_COLS_OFFSET,&(stemdb->num_cols),2);
@@ -423,12 +429,15 @@ static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
 
   if ((stemdb->data = mmap(NULL,stemdb->data_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->data_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap data segment");
+  madvise(stemdb->data, stemdb->data_size, MADV_RANDOM);
 
   if ((stemdb->free = mmap(NULL,stemdb->free_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->free_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap free segment");
+  madvise(stemdb->free, stemdb->free_size, MADV_RANDOM);
 
   if ((stemdb->meta = mmap(NULL,stemdb->meta_size,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->meta_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
+  madvise(stemdb->meta, stemdb->meta_size, MADV_RANDOM);
  
   stemdb->num_cols = *(uint16_t*)(stemdb->meta + META_NUM_COLS_OFFSET);
   stemdb->row_size = *(uint32_t*)(stemdb->meta + META_ROW_SIZE_OFFSET);
@@ -444,10 +453,13 @@ static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
       return PyErr_Format(PyExc_OSError,"failed to open index file: %s", key->name);
     if ((key->data = mmap(NULL,key->data_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->data_fd,0)) == MAP_FAILED)
       return PyErr_Format(PyExc_OSError,"failed to mmap data segment");
+    madvise(key->data, key->data_size, MADV_RANDOM);
     if ((key->free = mmap(NULL,key->free_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->free_fd,0)) == MAP_FAILED)
       return PyErr_Format(PyExc_OSError,"failed to mmap free segment");
+    madvise(key->free, key->free_size, MADV_RANDOM);
     if ((key->meta = mmap(NULL,key->meta_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->meta_fd,0)) == MAP_FAILED)
       return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
+    madvise(key->meta, key->meta_size, MADV_RANDOM);
 
     key->many = *(uint64_t*)(key->meta + META_KEY_MANY_OFFSET);
   }
@@ -992,13 +1004,15 @@ static PyObject * stemdb_add_key(PyStemDBObject *stemdb, PyObject *args) {
 
   if ((key->data = mmap(NULL,key->data_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->data_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap data segment");
+  madvise(key->data, key->data_size, MADV_SEQUENTIAL);
 
   if ((key->free = mmap(NULL,key->free_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->free_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap free segment");
+  madvise(key->free, key->free_size, MADV_SEQUENTIAL);
 
   if ((key->meta = mmap(NULL,key->meta_size,PROT_READ | PROT_WRITE,MAP_SHARED,key->meta_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
-
+  madvise(key->meta, key->meta_size, MADV_SEQUENTIAL);
 
   memcpy(key->meta + META_KEY_NUM_COLS_OFFSET,&(num_key_cols),sizeof(uint16_t));
   uint64_t num_nodes = 0,num_free_nodes = 0;
@@ -1109,6 +1123,13 @@ static void stemdb_dealloc(PyStemDBObject *stemdb) {
     close(stemdb->free_fd);
   if (stemdb->meta_fd >= 0)
     close(stemdb->meta_fd);
+
+  msync(stemdb->data, stemdb->data_size, MS_SYNC);
+  msync(stemdb->free, stemdb->free_size, MS_SYNC);
+  msync(stemdb->meta, stemdb->meta_size, MS_SYNC);
+  munmap(stemdb->data, stemdb->data_size);
+  munmap(stemdb->free, stemdb->free_size);
+  munmap(stemdb->meta, stemdb->meta_size);
   
   uint16_t n;
   stemdb_key *key;
@@ -1120,6 +1141,14 @@ static void stemdb_dealloc(PyStemDBObject *stemdb) {
       close(key->free_fd);
     if (key->meta_fd >= 0)
       close(key->meta_fd);
+
+    msync(key->data, stemdb->data_size, MS_SYNC);
+    msync(key->free, stemdb->free_size, MS_SYNC);
+    msync(key->meta, stemdb->meta_size, MS_SYNC);
+    munmap(key->data, key->data_size);
+    munmap(key->free, key->free_size);
+    munmap(key->meta, key->meta_size);
+
     free(key);
   }
   
