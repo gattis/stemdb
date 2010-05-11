@@ -4,7 +4,7 @@ All popular databases used today are what I call "macro" databases.  This includ
 
 ==How is StemDB different?==
 
-StemDB is a "micro" database.  For now it only handles:
+StemDB is a "micro" database.  For now it handles:
 
   * Storing any number of rows/columns, where you can specify for each column its data column and number of bits
     * number of bits doesn't have to be byte-aligned, so you can pack your data into 5-bit integers if it you need the space.
