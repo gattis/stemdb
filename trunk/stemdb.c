@@ -479,28 +479,6 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
     col = stemdb->meta + META_HEADER_SIZE + col_indexes[i] * sizeof(meta_col);
     for (b = 0; b < col->num_bits; b++, bit_pos++) {
 
-      if (is_linked_list(cur_node)) {
-	first_node = cur_node;
-	many = 1;
-	entry = get_right_entry(cur_node);
-	while (entry != 0) { 
-	  many += 1;
-	  cur_node = key->data + entry;
-	  entry = get_right_entry(cur_node);
-	}
-
-	if (many > key->many && key->many != 0)
-	  return first_node;
-
-	next_node = new_node(key);
-	set_linked_list(new_node);
-	set_left_entry(new_node,index);
-	set_right_entry(new_node,0);
-	set_right_entry(cur_node,next_node - key->data);
-	return NULL;
-      }
-
-
       bit = isbitset(row,col->bit_offset+b);
       if (bit) { // right
 	entry = get_right_entry(cur_node);
@@ -579,12 +557,40 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	  }
 	}
       }
-    } 
+
+      if (is_linked_list(cur_node)) {
+	first_node = cur_node;
+	many = 1;
+	entry = get_right_entry(cur_node);
+	while (entry != 0) { 
+	  many += 1;
+	  cur_node = key->data + entry;
+	  entry = get_right_entry(cur_node);
+	}
+
+	if (many > key->many && key->many != 0)
+	  return first_node;
+
+	next_node = new_node(key);
+	set_linked_list(next_node);
+	set_left_entry(next_node,index);
+	set_right_entry(next_node,0);
+	set_right_entry(cur_node,next_node - key->data);
+	return NULL;
+      }
+
+    }
   }
 
-
-  set_left_entry(cur_node,carry_entry);
   set_linked_list(cur_node);
+  set_left_entry(cur_node,carry_entry);
+
+  next_node = new_node(key);
+  memset(next_node,0,NODE_SIZE);
+  set_linked_list(next_node);
+  set_left_entry(next_node,index);
+
+  set_right_entry(cur_node,next_node - key->data);
 
   return NULL;
 
