@@ -15,12 +15,9 @@
 - stemdbtype.delete(key_name,[val1,val2,...]) 
     - deletes from data and key index
 - stemdb.delete_key
-- Support anonymous mmap
 - Support greater than, less than
 - Support floating point data
 - Support binary thats not byte-aligned
-- stemdbtype.get_index(key_name,[val1,val2,...]) => [index1,index2,...]
-- Support file sizes greater than memory? or let OS page?
 - support locking / multi-threading / multiple reader procs or writers
 - server mode
 - horizontal scaling
@@ -183,8 +180,9 @@ static inline void * new_row(PyStemDBObject *stemdb) {
   if (((*num_rows + 1) * stemdb->row_bytes) > stemdb->data_size) {
     madvise(stemdb->data + stemdb->data_size - ALLOCATION, ALLOCATION, MADV_RANDOM);
     stemdb->data_size += ALLOCATION;
-    if (ftruncate(stemdb->data_fd, stemdb->data_size) == -1)
-      return PyErr_Format(PyExc_OSError,"ftruncate failed");
+    if (stemdb->data_fd >= 0)
+      if (ftruncate(stemdb->data_fd, stemdb->data_size) == -1)
+	return PyErr_Format(PyExc_OSError,"ftruncate failed");
     madvise(stemdb->data + stemdb->data_size - ALLOCATION, ALLOCATION, MADV_SEQUENTIAL);
   }
 
@@ -204,8 +202,9 @@ static inline void *new_node(stemdb_key *key) {
   if (((*num_nodes + 1) * NODE_SIZE) > key->data_size) {
     madvise(key->data + key->data_size - ALLOCATION, ALLOCATION, MADV_RANDOM);
     key->data_size += ALLOCATION;
-    if (ftruncate(key->data_fd, key->data_size) == -1)
-      return PyErr_Format(PyExc_OSError,"ftruncate failed");
+    if (key->data_fd >= 0)
+      if (ftruncate(key->data_fd, key->data_size) == -1)
+	return PyErr_Format(PyExc_OSError,"ftruncate failed");
     madvise(key->data + key->data_size - ALLOCATION, ALLOCATION, MADV_SEQUENTIAL);
   }
 
@@ -237,6 +236,8 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
   stemdb->keys = NULL;
   stemdb->num_keys = 0;
   
+  int mmap_flags = MAP_SHARED;
+
   if (dir_name != NULL) {
 
     if (mkdir(dir_name, S_IRWXU | S_IRWXG) < 0)
@@ -265,20 +266,21 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
     strcpy(stemdb->dir_name,dir_name);
   } else {
     stemdb->dir_name = NULL;
-    return Py_BuildValue("");
+    mmap_flags |= MAP_ANON;
+    stemdb->data_fd = -1;
+    stemdb->free_fd = -1;
+    stemdb->meta_fd = -1;
   }
 
-
-
-  if ((stemdb->data = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->data_fd,0)) == MAP_FAILED)
+  if ((stemdb->data = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,mmap_flags,stemdb->data_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap data segment: %d", errno);
   madvise(stemdb->data, stemdb->data_size, MADV_SEQUENTIAL);
 
-  if ((stemdb->free = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->free_fd,0)) == MAP_FAILED)
+  if ((stemdb->free = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,mmap_flags,stemdb->free_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap free segment: %d", errno);
   madvise(stemdb->free, stemdb->free_size, MADV_SEQUENTIAL);
 
-  if ((stemdb->meta = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->meta_fd,0)) == MAP_FAILED)
+  if ((stemdb->meta = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,mmap_flags,stemdb->meta_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap meta segment: %d", errno);
   madvise(stemdb->meta, stemdb->meta_size, MADV_SEQUENTIAL);
  
@@ -985,6 +987,8 @@ static PyObject * stemdb_add_key(PyStemDBObject *stemdb, PyObject *args) {
   key->data_size = ALLOCATION;
   key->free_size = ALLOCATION;
 
+  int mmap_flags = MAP_SHARED;
+
   if (stemdb->dir_name != NULL) {
 
     long dir_name_len = strlen(stemdb->dir_name);
@@ -1008,19 +1012,21 @@ static PyObject * stemdb_add_key(PyStemDBObject *stemdb, PyObject *args) {
 	ftruncate(key->meta_fd, key->meta_size) == -1)
       return PyErr_Format(PyExc_OSError,"failed to write files to disk");
   } else {
-
-    return PyErr_Format(PyExc_OSError,"In-memory indexing not implemented yet");
+    mmap_flags |= MAP_ANON;
+    key->data_fd = -1;
+    key->free_fd = -1;
+    key->meta_fd = -1;
   }
 
-  if ((key->data = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,key->data_fd,0)) == MAP_FAILED)
+  if ((key->data = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,mmap_flags,key->data_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap data segment");
   madvise(key->data, key->data_size, MADV_SEQUENTIAL);
 
-  if ((key->free = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,key->free_fd,0)) == MAP_FAILED)
+  if ((key->free = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,mmap_flags,key->free_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap free segment");
   madvise(key->free, key->free_size, MADV_SEQUENTIAL);
 
-  if ((key->meta = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,key->meta_fd,0)) == MAP_FAILED)
+  if ((key->meta = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,mmap_flags,key->meta_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
   madvise(key->meta, key->meta_size, MADV_SEQUENTIAL);
 
