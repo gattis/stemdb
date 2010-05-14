@@ -8,21 +8,20 @@
 
 
 /* 
-
 === TODO ===
 
-- stemdbtype[x] = [val1,val2,...]
-- stemdbtype.delete(key_name,[val1,val2,...]) 
-    - deletes from data and key index
+v0.x:
+- make get faster by only checking tail after search
+- in key node deletion, keep track of traversal history then after go back and free available key nodes.  also collapse 1-entry linked lists.
 - stemdb.delete_key
 - Support greater than, less than
 - Support floating point data
-- Support binary thats not byte-aligned
+
+v1.0:
 - support locking / multi-threading / multiple reader procs or writers
 - server mode
 - horizontal scaling
 - transactions?
-
 */
 
 typedef struct {
@@ -51,14 +50,17 @@ typedef struct {
   void *data;
   void *meta;
   uint64_t *free;
+  unsigned char *pres;
 
   int data_fd;
   int meta_fd;
   int free_fd;
+  int pres_fd;
 
   uint64_t data_size;
   uint64_t meta_size;
   uint64_t free_size;
+  uint64_t pres_size;
 
   uint16_t num_cols;
   uint32_t row_size;
@@ -169,10 +171,12 @@ static inline void set_right_entry(void *node, uint64_t val) {
 
 static inline void * new_row(PyStemDBObject *stemdb) {
 
-  uint64_t *num_free = stemdb->meta + META_NUM_FREE_ROWS_OFFSET;
+  uint64_t *num_free = stemdb->meta + META_NUM_FREE_ROWS_OFFSET, offset;
   if (*num_free > 0) {
     (*num_free)--;
-    return stemdb->data + stemdb->free[*num_free];
+    offset = stemdb->free[*num_free];
+    setbit(stemdb->pres, offset / stemdb->row_bytes);
+    return stemdb->data + offset;
   }
 
   uint64_t *num_rows = stemdb->meta + META_NUM_ROWS_OFFSET;
@@ -182,10 +186,20 @@ static inline void * new_row(PyStemDBObject *stemdb) {
     stemdb->data_size += ALLOCATION;
     if (stemdb->data_fd >= 0)
       if (ftruncate(stemdb->data_fd, stemdb->data_size) == -1)
-	return PyErr_Format(PyExc_OSError,"ftruncate failed");
+	return PyErr_Format(PyExc_OSError,"ftruncate failed on data file");
     madvise(stemdb->data + stemdb->data_size - ALLOCATION, ALLOCATION, MADV_SEQUENTIAL);
   }
 
+  if (((*num_rows + 1) / 8.) > stemdb->pres_size) {
+    madvise(stemdb->pres + stemdb->pres_size - ALLOCATION, ALLOCATION, MADV_RANDOM);
+    stemdb->pres_size += ALLOCATION;
+    if (stemdb->pres_fd >= 0)
+      if (ftruncate(stemdb->pres_fd, stemdb->pres_size) == -1)
+	return PyErr_Format(PyExc_OSError,"ftruncate failed on pres file");
+    madvise(stemdb->pres + stemdb->pres_size - ALLOCATION, ALLOCATION, MADV_SEQUENTIAL);
+  }
+
+  setbit(stemdb->pres,*num_rows);
   (*num_rows)++;
   return stemdb->data + stemdb->row_bytes * (*num_rows - 1);
 
@@ -233,6 +247,7 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
   stemdb->meta_size = META_HEADER_SIZE+num_cols*sizeof(meta_col);
   stemdb->data_size = ALLOCATION;
   stemdb->free_size = ALLOCATION;
+  stemdb->pres_size = ALLOCATION;
   stemdb->keys = NULL;
   stemdb->num_keys = 0;
   
@@ -256,10 +271,14 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
     strcpy(file_name+dir_name_len,"/meta");
     stemdb->meta_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC | O_NOATIME, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 
-    if (stemdb->data_fd == -1 || stemdb->free_fd == -1 || stemdb->meta_fd == -1 || 
+    strcpy(file_name+dir_name_len,"/pres");
+    stemdb->pres_fd = open(file_name, O_RDWR | O_CREAT | O_TRUNC | O_NOATIME, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+
+    if (stemdb->data_fd == -1 || stemdb->free_fd == -1 || stemdb->meta_fd == -1 || stemdb->pres_fd == -1 ||
 	ftruncate(stemdb->data_fd, stemdb->data_size) == -1 ||
 	ftruncate(stemdb->free_fd, stemdb->free_size) == -1 ||
-	ftruncate(stemdb->meta_fd, stemdb->meta_size) == -1)
+	ftruncate(stemdb->meta_fd, stemdb->meta_size) == -1 ||
+	ftruncate(stemdb->pres_fd, stemdb->pres_size) == -1)
       return PyErr_Format(PyExc_OSError,"failed to write files to disk");
 
     stemdb->dir_name = malloc(dir_name_len+1);
@@ -270,6 +289,7 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
     stemdb->data_fd = -1;
     stemdb->free_fd = -1;
     stemdb->meta_fd = -1;
+    stemdb->pres_fd = -1;
   }
 
   if ((stemdb->data = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,mmap_flags,stemdb->data_fd,0)) == MAP_FAILED)
@@ -283,6 +303,10 @@ static PyObject* stemdb_new(PyObject *self, PyObject *args) {
   if ((stemdb->meta = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,mmap_flags,stemdb->meta_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap meta segment: %d", errno);
   madvise(stemdb->meta, stemdb->meta_size, MADV_SEQUENTIAL);
+
+  if ((stemdb->pres = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,mmap_flags,stemdb->pres_fd,0)) == MAP_FAILED)
+    return PyErr_Format(PyExc_OSError,"failed to mmap meta segment: %d", errno);
+  madvise(stemdb->pres, stemdb->pres_size, MADV_SEQUENTIAL);
  
   stemdb->num_cols = num_cols;
   memcpy(stemdb->meta + META_NUM_COLS_OFFSET,&(stemdb->num_cols),2);
@@ -402,6 +426,9 @@ static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
     } else if (strcmp(ep->d_name,"meta") == 0) {
       stemdb->meta_size = st.st_size;
       stemdb->meta_fd = fd;
+    } else if (strcmp(ep->d_name,"pres") == 0) {
+      stemdb->pres_size = st.st_size;
+      stemdb->pres_fd = fd;
     } else if (strstr(ep->d_name,".keyd")) {
       key = open_key(stemdb, ep->d_name);
       key->data_size = st.st_size;
@@ -416,7 +443,7 @@ static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
       key->meta_fd = fd;
     }
     
-    if (stemdb->data_fd == -1 || stemdb->free_fd == -1 || stemdb->meta_fd == -1)
+    if (stemdb->data_fd == -1 || stemdb->free_fd == -1 || stemdb->meta_fd == -1 || stemdb->pres_fd == -1)
       return PyErr_Format(PyExc_OSError,"failed to open files from disk: %s", file_name);
 
   }
@@ -436,6 +463,10 @@ static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
   if ((stemdb->meta = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->meta_fd,0)) == MAP_FAILED)
     return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
   madvise(stemdb->meta, stemdb->meta_size, MADV_RANDOM);
+
+  if ((stemdb->pres = mmap(NULL,RESERVE,PROT_READ | PROT_WRITE,MAP_SHARED,stemdb->pres_fd,0)) == MAP_FAILED)
+    return PyErr_Format(PyExc_OSError,"failed to mmap meta segment");
+  madvise(stemdb->pres, stemdb->pres_size, MADV_RANDOM);
  
   stemdb->num_cols = *(uint16_t*)(stemdb->meta + META_NUM_COLS_OFFSET);
   stemdb->row_size = *(uint32_t*)(stemdb->meta + META_ROW_SIZE_OFFSET);
@@ -470,16 +501,15 @@ static PyObject* stemdb_open(PyObject *self, PyObject *py_dir_name) {
 void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 
   uint16_t i,b, *num_key_cols = key->meta + META_KEY_NUM_COLS_OFFSET;
-  uint32_t bit_pos = 0;
   uint16_t *col_indexes = key->meta + META_KEY_COLS_OFFSET;
   void *cur_node = key->data, *next_node, *first_node;
   meta_col *col;
   uint64_t entry,carry_entry = 0, many;
-  unsigned char bit, *row = stemdb->data + stemdb->row_bytes * index;
+  unsigned char bit, *row = stemdb->data + stemdb->row_bytes * index, have_carry = 0;
 
   for (i = 0; i < *num_key_cols; i++) {
     col = stemdb->meta + META_HEADER_SIZE + col_indexes[i] * sizeof(meta_col);
-    for (b = 0; b < col->num_bits; b++, bit_pos++) {
+    for (b = 0; b < col->num_bits; b++) {
 
       bit = isbitset(row,col->bit_offset+b);
       if (bit) { // right
@@ -490,24 +520,24 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	  next_node = new_node(key);
 	  memset(next_node,0,NODE_SIZE);
 	  carry_entry = entry;
+	  have_carry = 1;
 	  right_unset_leaf_node(cur_node);
 	  set_right_entry(cur_node,next_node - key->data);
 	  cur_node = next_node;
 	} else { // pointer node
 	  if (entry == 0) { // null pointer
-	    if ((!left_is_leaf_node(cur_node)) && (get_left_entry(cur_node) == 0) && (cur_node != key->data)) {
-	      if (isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) {
+	    if (have_carry) {
+	      if (isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) { // both carry and index must go right
 		next_node = new_node(key);
 		memset(next_node,0,NODE_SIZE);
 		right_unset_leaf_node(cur_node);
 		set_right_entry(cur_node,next_node - key->data);
 		cur_node = next_node;
-	      } else { 
+	      } else { // carry goes left and index goes right
 		set_left_entry(cur_node,carry_entry);
 		left_set_leaf_node(cur_node);
 		set_right_entry(cur_node, index);
 		right_set_leaf_node(cur_node);
-
 		return NULL;
 	      }
 	    } else {
@@ -524,25 +554,24 @@ void * index_row(PyStemDBObject *stemdb, uint64_t index, stemdb_key *key) {
 	if (left_is_leaf_node(cur_node)) { // leaf node
 	  if ((b == (col->num_bits - 1)) && (i == (*num_key_cols - 1)) && (key->many == 1))
 	    return cur_node; // todo: return indication of which side is the dupe
-
 	  next_node = new_node(key);
 	  memset(next_node,0,NODE_SIZE);
-
 	  carry_entry = entry;
+	  have_carry = 1;
 	  left_unset_leaf_node(cur_node);
 	  set_left_entry(cur_node,next_node - key->data);
 	  cur_node = next_node;
 	  
 	} else { // pointer node
 	  if (entry == 0) { // null pointer
-	    if ((!right_is_leaf_node(cur_node)) && (get_right_entry(cur_node) == 0) && (cur_node != key->data)) {
-	      if (!isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) {
+	    if (have_carry) {
+	      if (!isbitset(stemdb->data + stemdb->row_bytes * carry_entry, col->bit_offset+b)) { // both carry and index must go left
 		next_node = new_node(key);
 		memset(next_node,0,NODE_SIZE);
 		left_unset_leaf_node(cur_node);
 		set_left_entry(cur_node,next_node - key->data);
 		cur_node = next_node;
-	      } else {
+	      } else { // carry goes right and index goes left
 		set_right_entry(cur_node,carry_entry);
 		right_set_leaf_node(cur_node);
 		set_left_entry(cur_node, index);
@@ -696,13 +725,10 @@ static PyObject * stemdb_insert(PyStemDBObject *stemdb, PyObject *py_rows) {
 #define CONTINUE 0
 #define FOUND_LEFT 1
 #define FOUND_RIGHT 2
-#define FOUND_LL 3
-#define NOT_FOUND 4
+#define NOT_FOUND 3
 
-static inline int find_row(stemdb_key *key, unsigned char bit, uint32_t bit_pos, void **cur_node) {
+static inline int find_row(stemdb_key *key, unsigned char bit, void **cur_node) {
   uint64_t entry;
-  if (is_linked_list(*cur_node))
-    return FOUND_LL;
   
   if (bit) {
     if (right_is_leaf_node(*cur_node)) 
@@ -786,7 +812,7 @@ static PyObject * stemdb_get(PyStemDBObject *stemdb, PyObject *args) {
 
   uint16_t *col_indexes = key->meta + META_KEY_COLS_OFFSET;
   meta_col *db_col = stemdb->meta + META_HEADER_SIZE;
-  uint32_t bit_pos = 0, num_bits;
+  uint32_t bit_pos, num_bits;
   void *cur_node = key->data;
 
   found = NOT_FOUND;
@@ -805,9 +831,9 @@ static PyObject * stemdb_get(PyStemDBObject *stemdb, PyObject *args) {
       if (ival >= pow(2,num_bits-1) || ival < -pow(2,num_bits-1))
 	return PyErr_Format(PyExc_TypeError,"signed integer out of range in column %zd",i);
       
-      for (b = 0; b < num_bits; b++, bit_pos++) {
-	if (ival & (1 << b)) found = find_row(key, 1, bit_pos, &cur_node);
-	else found = find_row(key, 0, bit_pos, &cur_node);
+      for (b = 0; b < num_bits; b++) {
+	if (ival & (1 << b)) found = find_row(key, 1, &cur_node);
+	else found = find_row(key, 0, &cur_node);
 	if (found != CONTINUE) break;
       }
       
@@ -821,9 +847,9 @@ static PyObject * stemdb_get(PyStemDBObject *stemdb, PyObject *args) {
       if (uval >= pow(2,num_bits))
 	return PyErr_Format(PyExc_TypeError,"unsigned integer out of range in column %zd",i);
       
-      for (b = 0; b < num_bits; b++, bit_pos++) {
-	if (uval & (1 << b)) found = find_row(key, 1, bit_pos, &cur_node);
-	else found = find_row(key, 0, bit_pos, &cur_node);
+      for (b = 0; b < num_bits; b++) {
+	if (uval & (1 << b)) found = find_row(key, 1, &cur_node);
+	else found = find_row(key, 0, &cur_node);
 	if (found != CONTINUE) break;
       }
 
@@ -836,9 +862,9 @@ static PyObject * stemdb_get(PyStemDBObject *stemdb, PyObject *args) {
       PyObject_AsReadBuffer(py_val,(const void **)(&buffer),&bufsize);
       if (bufsize*8 != num_bits) return PyErr_Format(PyExc_TypeError,"buffer must have 1-byte elements and a total size of %d bits at column %zd", num_bits,i);
       for (bufpos = 0; bufpos < bufsize; bufpos++)
-	for (b = 0; b < 8; b++, bit_pos++) {
-	  if (buffer[bufpos] & (1 << b)) found = find_row(key, 1, bit_pos, &cur_node);
-	  else found = find_row(key, 0, bit_pos, &cur_node);
+	for (b = 0; b < 8; b++) {
+	  if (buffer[bufpos] & (1 << b)) found = find_row(key, 1, &cur_node);
+	  else found = find_row(key, 0, &cur_node);
 	  if (found != CONTINUE) break;
 	}
       break;
@@ -851,7 +877,7 @@ static PyObject * stemdb_get(PyStemDBObject *stemdb, PyObject *args) {
   if (found == NOT_FOUND) 
     return py_indexes;
 
-  if (found == CONTINUE || found == FOUND_LL) {
+  if (found == CONTINUE) {
     collect_children(key,cur_node,&py_indexes);
     return py_indexes;
   }
@@ -875,7 +901,7 @@ static PyObject * stemdb_get(PyStemDBObject *stemdb, PyObject *args) {
       if (ival >= pow(2,num_bits-1) || ival < -pow(2,num_bits-1))
 	return PyErr_Format(PyExc_TypeError,"signed integer out of range in col %zd",i);
       
-      for (b = 0; b < num_bits; b++, bit_pos++) {
+      for (b = 0; b < num_bits; b++) {
 	if (ival & (1 << b)) {
 	  if (!isbitset(row,db_col[c].bit_offset+b)) 
 	    return py_indexes;
@@ -895,7 +921,7 @@ static PyObject * stemdb_get(PyStemDBObject *stemdb, PyObject *args) {
       if (uval >= pow(2,num_bits))
 	return PyErr_Format(PyExc_TypeError,"unsigned integer out of range in col %zd",i);
       
-      for (b = 0; b < num_bits; b++, bit_pos++) {
+      for (b = 0; b < num_bits; b++) {
 	if (uval & (1 << b)) {
 	  if (!isbitset(row,db_col[c].bit_offset+b))
 	    return py_indexes;
@@ -1062,7 +1088,8 @@ static PyObject * stemdb_add_key(PyStemDBObject *stemdb, PyObject *args) {
 }
 
 static Py_ssize_t stemdb_length(PyStemDBObject *stemdb) {
-  return stemdb->num_cols;
+  uint64_t *num_rows = stemdb->meta + META_NUM_ROWS_OFFSET;
+  return *num_rows;
 }
 
 static PyObject * stemdb_item(PyStemDBObject *stemdb, Py_ssize_t index) {
@@ -1074,8 +1101,15 @@ static PyObject * stemdb_item(PyStemDBObject *stemdb, Py_ssize_t index) {
   unsigned char *buffer;
 
   uint64_t *num_rows = stemdb->meta + META_NUM_ROWS_OFFSET;
+
+  if (index < 0)
+    return PyErr_Format(PyExc_ValueError,"index must be greater than or equal to zero");
   if (index >= *num_rows)
-    return PyErr_Format(PyExc_TypeError,"index too large, db only has %llu rows",*num_rows);
+    return PyErr_Format(PyExc_ValueError,"index too large, db only has %lu rows",(unsigned long)(*num_rows));
+
+  if (!isbitset(stemdb->pres,index))
+    return PyErr_Format(PyExc_ValueError,"index does not exist");
+
   unsigned char *bf = stemdb->data + stemdb->row_bytes * index;
   bit_pos = 0;
 
@@ -1129,6 +1163,118 @@ static PyObject * stemdb_item(PyStemDBObject *stemdb, Py_ssize_t index) {
 }
 
 
+static int stemdb_assign(PyStemDBObject *stemdb, Py_ssize_t index, PyObject *v) {
+
+  uint64_t *num_rows = stemdb->meta + META_NUM_ROWS_OFFSET;
+  if (index < 0) {
+    PyErr_Format(PyExc_ValueError,"index must be greater than or equal to zero");
+    return -1;
+  }
+  if (index >= *num_rows) {
+    PyErr_Format(PyExc_ValueError,"index too large, db only has %lu rows",(unsigned long)(*num_rows));
+    return -1;
+  }
+  if (v != NULL) {
+    PyErr_Format(PyExc_ValueError,"you cannot assign items, only delete and insert");
+    return -1;
+  }
+
+  if (!isbitset(stemdb->pres,index)) {
+    PyErr_Format(PyExc_ValueError,"index does not exist");
+    return -1;
+  }
+
+  uint16_t n,c,b,*num_cols,*col_indexes;
+  int found;
+  stemdb_key *key;
+  meta_col *col;
+  void *cur_node, *prev_node;
+  unsigned char bit, *row = stemdb->data + stemdb->row_bytes * index;
+  for (n = 0; n < stemdb->num_keys; n++) {
+    key = stemdb->keys[n];
+    num_cols = key->meta + META_KEY_NUM_COLS_OFFSET;
+    col_indexes = key->meta + META_KEY_COLS_OFFSET;
+    cur_node = key->data;
+    prev_node = NULL;
+    found = NOT_FOUND;
+    for (c = 0; c < *num_cols; c++) {
+      col = stemdb->meta + META_HEADER_SIZE + sizeof(meta_col) * col_indexes[c];
+      for (b = 0; b < col->num_bits; b++) {
+	bit = isbitset(row,col->bit_offset+b);
+	prev_node = cur_node;
+	found = find_row(key, bit, &cur_node);
+	if (found != CONTINUE) break;
+      }
+      if (found != CONTINUE) break;
+    }
+    
+    if (found == CONTINUE) { // must be linked list
+      void *tree_node = prev_node;
+      uint64_t entry;
+      while (get_left_entry(cur_node) != index) {
+	prev_node = cur_node;
+	entry = get_right_entry(cur_node);
+	if (entry == 0) {
+	  cur_node = NULL;
+	  break;
+	}
+	cur_node = key->data + entry;
+      }
+      
+      if (prev_node == tree_node) {
+	if (get_left_entry(tree_node) == (cur_node - key->data))
+	  set_left_entry(tree_node, get_right_entry(cur_node));
+	else
+	  set_right_entry(tree_node, get_right_entry(cur_node));
+      } else {
+	set_right_entry(prev_node,get_right_entry(cur_node));
+      }
+      
+      uint64_t *num_free_nodes = key->meta + META_KEY_NUM_FREE_NODES_OFFSET;
+      if (((*num_free_nodes + 1) * sizeof(uint64_t)) > key->free_size) {
+	madvise(key->free + key->free_size - ALLOCATION, ALLOCATION, MADV_RANDOM);
+	key->free_size += ALLOCATION;
+	if (key->free_fd >= 0)
+	  if (ftruncate(key->free_fd, key->free_size) == -1) {
+	    PyErr_Format(PyExc_OSError,"ftruncate failed on key free file");
+	    return -1;
+	  }
+	madvise(key->free + key->free_size - ALLOCATION, ALLOCATION, MADV_SEQUENTIAL);
+      }
+      key->free[*num_free_nodes] = cur_node - key->data;
+      (*num_free_nodes)++;
+      
+    } else if (found == FOUND_LEFT) {
+      if (get_left_entry(cur_node) == index) {
+	left_unset_leaf_node(cur_node);	
+	set_left_entry(cur_node,0);
+      }
+    } else if (found == FOUND_RIGHT) {
+      if (get_right_entry(cur_node) == index) {
+	right_unset_leaf_node(cur_node);
+	set_right_entry(cur_node,0);
+      }
+    }
+  }
+
+  unsetbit(stemdb->pres, index);
+  uint64_t *num_free = stemdb->meta + META_NUM_FREE_ROWS_OFFSET;
+  if (((*num_free + 1) * sizeof(uint64_t)) > stemdb->free_size) {
+    madvise(stemdb->free + stemdb->free_size - ALLOCATION, ALLOCATION, MADV_RANDOM);
+    stemdb->free_size += ALLOCATION;
+    if (stemdb->free_fd >= 0)
+      if (ftruncate(stemdb->free_fd, stemdb->free_size) == -1) {
+	PyErr_Format(PyExc_OSError,"ftruncate failed on free file");
+	return -1;
+      }
+    madvise(stemdb->free + stemdb->free_size - ALLOCATION, ALLOCATION, MADV_SEQUENTIAL);
+  }
+  
+  stemdb->free[*num_free] = index * stemdb->row_bytes;
+  (*num_free)++;    
+
+  return 0;
+}
 
 static void stemdb_dealloc(PyStemDBObject *stemdb) {
 
@@ -1219,7 +1365,7 @@ static PyObject * stemdb_test(PyObject *self, PyObject *nothing) {
 static PyMethodDef stemdb_methods[] = {
   {"insert", (PyCFunction) stemdb_insert, METH_O},
   {"add_key", (PyCFunction) stemdb_add_key, METH_VARARGS},
-  {"get", (PyCFunction) stemdb_get, METH_VARARGS}, 
+  {"get", (PyCFunction) stemdb_get, METH_VARARGS},
   {NULL, NULL}
 };
 
@@ -1234,7 +1380,7 @@ static PySequenceMethods stemdb_as_sequence = {
   0,/* sq_repeat */
   (ssizeargfunc)stemdb_item,/* sq_item */
   0,/* sq_slice */
-  0,/* sq_ass_item */
+  (ssizeobjargproc)stemdb_assign,/* sq_ass_item */
   0,/* sq_ass_slice */
   0,/* sq_contains */
   0,/* sq_inplace_concat */
