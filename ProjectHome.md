@@ -1,0 +1,1 @@
+StemDB is a database toolkit written in C/Python that allows the creation of any type of database (relational tables, key-value stores, graph databases, persistent, in-memory, and more) using primitives that are as fast, efficient, and scalable as possible.
